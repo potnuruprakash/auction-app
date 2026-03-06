@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "50575165484",
+    "project_id": "ipl-auction-app-d2984",
+    "storage_bucket": "ipl-auction-app-d2984.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:50575165484:android:5176e6f9fdc359f66e2989",
+        "android_client_info": {
+          "package_name": "com.example.ipl_auction_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB8boWr1LEG3IxLNJqfD-l-8K21R9Cbs6w"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:50575165484:android:b7ca2f812daa58d46e2989",
+        "android_client_info": {
+          "package_name": "com.example.ipl_auction_pro"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB8boWr1LEG3IxLNJqfD-l-8K21R9Cbs6w"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
