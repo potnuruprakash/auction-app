@@ -1,4 +1,4 @@
-# ipl_auction_pro
+# auction-app (IPL Auction Pro)
 
 A new Flutter project.
 
