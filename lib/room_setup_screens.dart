@@ -631,12 +631,10 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
                   ),
                 ),
                 const SizedBox(height: 16),
-                
                 Expanded(
                   child: StreamBuilder<QuerySnapshot>(
                     stream: FirebaseFirestore.instance.collection("rooms")
-                        .where("status", isNotEqualTo: "ended")
-                        .orderBy("status")
+                        .where("status", isEqualTo: "live")
                         .orderBy("createdAt", descending: true)
                         .snapshots(),
                     builder: (context, snapshot) {
@@ -645,10 +643,14 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
                       }
                       
                       if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-                        return Center(
-                          child: Text(
-                            "No live auctions available.",
-                            style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 16),
+                        return const Center(
+                          child: Padding(
+                            padding: EdgeInsets.all(20.0),
+                            child: Text(
+                              "No live auctions available right now.",
+                              style: TextStyle(color: Colors.white54, fontSize: 16),
+                              textAlign: TextAlign.center,
+                            ),
                           ),
                         );
                       }
@@ -673,21 +675,25 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
                         padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
                         itemCount: docs.length,
                         itemBuilder: (context, index) {
-                          var data = docs[index].data() as Map<String, dynamic>;
+                          var doc = docs[index];
+                          var data = doc.data() as Map<String, dynamic>;
                           String roomName = data["roomName"] ?? "Auction Arena";
                           bool isPrivate = data["isPrivate"] ?? false;
-                          String roomCode = data["roomCode"] ?? docs[index].id;
+                          String roomCode = data["roomCode"] ?? doc.id;
+                          String hostName = data["hostName"] ?? "Unknown Host";
                           
                           return Padding(
                             padding: const EdgeInsets.only(bottom: 16.0),
                             child: _buildRoomCard(
+                              roomId: doc.id,
                               roomName: roomName,
                               isPrivate: isPrivate,
+                              hostName: hostName,
                               onTap: () {
                                 if (isPrivate) {
-                                  _showPrivateRoomPopup(docs[index].id, roomCode, roomName);
+                                  _showPrivateRoomPopup(doc.id, roomCode, roomName);
                                 } else {
-                                  _joinPublicRoom(docs[index].id);
+                                  _joinPublicRoom(doc.id);
                                 }
                               },
                             ),
@@ -705,7 +711,7 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
     );
   }
 
-  Widget _buildRoomCard({required String roomName, required bool isPrivate, required VoidCallback onTap}) {
+  Widget _buildRoomCard({required String roomId, required String roomName, required bool isPrivate, required String hostName, required VoidCallback onTap}) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
@@ -739,12 +745,30 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          roomName,
+                          style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(color: Colors.green.withOpacity(0.2), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.greenAccent)),
+                        child: const Text("LIVE", style: TextStyle(color: Colors.greenAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                      )
+                    ],
+                  ),
+                  const SizedBox(height: 4),
                   Text(
-                    roomName,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
+                    "Room ID: $roomId",
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.5),
+                      fontSize: 12,
+                      letterSpacing: 0.8,
                     ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
@@ -752,44 +776,25 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
                   const SizedBox(height: 4),
                   Row(
                     children: [
-                      Text(
-                        isPrivate ? "PRIVATE" : "PUBLIC",
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.5),
-                          fontSize: 12,
-                          letterSpacing: 1.0,
-                          fontWeight: FontWeight.bold,
-                        ),
+                      const Icon(Icons.person, color: Color(0xFFFFD700), size: 14),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text("Host: $hostName", style: const TextStyle(color: Colors.white70, fontSize: 14), overflow: TextOverflow.ellipsis),
                       ),
-                      const SizedBox(width: 12),
-                      Row(
-                        children: [
-                          AnimatedBuilder(
-                            animation: _pulseController,
-                            builder: (context, child) {
-                              return Container(
-                                width: 8,
-                                height: 8,
-                                decoration: BoxDecoration(
-                                  color: Colors.greenAccent,
-                                  shape: BoxShape.circle,
-                                  boxShadow: [
-                                    BoxShadow(
-                                      color: Colors.greenAccent.withOpacity(0.6 * _pulseController.value),
-                                      blurRadius: 8 * _pulseController.value,
-                                      spreadRadius: 2 * _pulseController.value,
-                                    ),
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-                          const SizedBox(width: 6),
-                          const Text(
-                            "Live",
-                            style: TextStyle(color: Colors.greenAccent, fontSize: 12),
-                          ),
-                        ],
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      const Icon(Icons.groups, color: Color(0xFFDAA520), size: 14),
+                      const SizedBox(width: 4),
+                      // Teams Joined Counter
+                      StreamBuilder<QuerySnapshot>(
+                        stream: FirebaseFirestore.instance.collection("rooms").doc(roomId).collection("participants").snapshots(),
+                        builder: (context, partSnap) {
+                          int count = partSnap.hasData ? partSnap.data!.docs.length : 0;
+                          return Text("Teams Joined: $count", style: const TextStyle(color: Colors.white54, fontSize: 12));
+                        }
                       ),
                     ],
                   ),

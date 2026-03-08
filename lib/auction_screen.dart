@@ -337,11 +337,16 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     List<QueryDocumentSnapshot> available = playersSnap.docs.where((p) => !processedIds.contains(p.id)).toList();
 
     if (available.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("No more players available!")));
-      }
-      return;
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("No more players available! Ending Auction...")));
     }
+    
+    // Auto-End Condition: No players remaining
+    if (widget.isHost) {
+       FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
+    }
+    return;
+  }
 
     // 2. Randomly select one
     var randomPlayer = available[Random().nextInt(available.length)];
@@ -774,6 +779,39 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                           ],
                         ),
                       ),
+                      Expanded(
+                        child: StreamBuilder<DocumentSnapshot>(
+                          stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).snapshots(),
+                          builder: (context, snapshot) {
+                             if (!snapshot.hasData) return const SizedBox.shrink();
+                             var data = snapshot.data!.data() as Map<String, dynamic>;
+                             bool isSold = data["sold"] ?? false;
+                             String highest = data["highestBidder"] ?? "";
+                             int currentBid = data["currentBid"] ?? 0;
+                             
+                             if (isSold) {
+                                if (highest.isNotEmpty) {
+                                   return FittedBox(
+                                     fit: BoxFit.scaleDown,
+                                     child: Text(
+                                       "SOLD to $highest for ₹${(currentBid / 10000000).toStringAsFixed(2)} Cr",
+                                       style: const TextStyle(color: Colors.redAccent, fontSize: 40, fontWeight: FontWeight.bold, letterSpacing: 2),
+                                     ),
+                                   );
+                                } else {
+                                   return const FittedBox(
+                                     fit: BoxFit.scaleDown,
+                                     child: Text(
+                                       "UNSOLD",
+                                       style: TextStyle(color: Colors.grey, fontSize: 40, fontWeight: FontWeight.bold, letterSpacing: 2),
+                                     ),
+                                   );
+                                }
+                             }
+                             return const SizedBox.shrink();
+                          }
+                        ),
+                      ),   
                       const SizedBox(width: 8),
                       // Bid Action Bar
                       if (_auctionStarted && !_sold)
@@ -803,8 +841,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                  Row(
                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                    children: [
-                     Text("Purse Remaining: ₹100.0 Cr", style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 12)),
-                     Text("Status: ${_sold ? 'SOLD' : (_auctionStarted ? 'LIVE' : 'WAITING')}", style: TextStyle(color: _sold ? Colors.red : Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold)),
+                     Text("Status: ${_sold ? (_highestBidder.isNotEmpty ? 'SOLD' : 'UNSOLD') : (_auctionStarted ? 'LIVE' : 'WAITING')}", style: TextStyle(color: _sold ? (_highestBidder.isNotEmpty ? Colors.red : Colors.grey) : Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold)),
                    ],
                  )
                ],
