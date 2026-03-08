@@ -634,7 +634,11 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
                 
                 Expanded(
                   child: StreamBuilder<QuerySnapshot>(
-                    stream: FirebaseFirestore.instance.collection("rooms").orderBy("createdAt", descending: true).snapshots(),
+                    stream: FirebaseFirestore.instance.collection("rooms")
+                        .where("status", isNotEqualTo: "ended")
+                        .orderBy("status")
+                        .orderBy("createdAt", descending: true)
+                        .snapshots(),
                     builder: (context, snapshot) {
                       if (snapshot.connectionState == ConnectionState.waiting) {
                         return const Center(child: CircularProgressIndicator(color: Color(0xFFFFD700)));

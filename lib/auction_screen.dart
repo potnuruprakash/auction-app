@@ -2,6 +2,7 @@ import 'dart:math';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 class AuctionScreen extends StatefulWidget {
@@ -63,10 +64,14 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   bool _auctionStarted = false;
 
   final TextEditingController _chatController = TextEditingController();
+  
+  late TabController _tabController;
+  StreamSubscription<DocumentSnapshot>? _roomSubscription;
 
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 5, vsync: this);
     _bgController = AnimationController(vsync: this, duration: const Duration(seconds: 15))..repeat(reverse: true);
     _spotlightController = AnimationController(vsync: this, duration: const Duration(seconds: 4))..repeat(reverse: true);
 
@@ -74,10 +79,40 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     // widget.isHost flag is purely for extra controls now.
 
     _listenToRoom();
+    _listenToPlayers(); // New listener for player data
     _startLocalTimerSync();
   }
 
-  void _listenToRoom() {
+  void _showAuctionEndedDialog() {
+      // Force UI to show Results tab (Index 3, as per the current TabBar structure)
+      if (_tabController != null) {
+         _tabController.animateTo(3); // Changed index to 3 based on current TabBar
+      }
+      
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          backgroundColor: const Color(0xFF1E1005),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: const BorderSide(color: Color(0xFFDAA520))),
+          title: const Text("Auction Ended", style: TextStyle(color: Color(0xFFFFD700), fontWeight: FontWeight.bold)),
+          content: const Text("The session has concluded. Redirecting to final results.", style: TextStyle(color: Colors.white)),
+          actions: [
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFFD700), foregroundColor: Colors.black),
+              onPressed: () => Navigator.pop(context), 
+              child: const Text("View Results")
+            ),
+            TextButton(
+               onPressed: () { Navigator.pop(context); Navigator.pop(context); }, 
+               child: const Text("Exit Room", style: TextStyle(color: Colors.white54))
+            )
+          ]
+        )
+      );
+  }
+
+  void _listenToPlayers() {
     FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).snapshots().listen((snapshot) {
       if (snapshot.exists && mounted) {
         var data = snapshot.data()!;
@@ -97,8 +132,26 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
           _timerSetting = data["timerSetting"] ?? 30;
           _endTimeEpoch = data["endTimeEpoch"] ?? 0;
         });
+      }
+    });
+  }
 
-        // Track locked teams if needed (mock for now, storing in activity or subcollection is better)
+  void _listenToRoom() {
+    _roomSubscription = FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).snapshots().listen((snapshot) {
+      if (snapshot.exists) {
+        var data = snapshot.data()!;
+        if (!mounted) return;
+        
+        // Host Exit / Status Ended Check
+        if (data["status"] == "ended") {
+           _showAuctionEndedDialog();
+        } else {
+           setState(() {
+             // These are already handled by _listenToPlayers, but keeping for robustness if _listenToPlayers is delayed
+             _currentBid = data["currentBid"] ?? 0;
+             _highestBidder = data["highestBidder"] ?? "";
+           });
+        }
       }
     });
   }
@@ -142,9 +195,33 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
        });
 
        if (!isUnsold && _currentPlayerId.isNotEmpty) {
-           // Save to sold subcollection
-           FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").doc(_currentPlayerId).set({
-              "name": _currentPlayerName,
+         // Deduct purse and Check for Auto-End Condition
+         FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").get().then((qSnap) async {
+            bool allPursesEmpty = true;
+            
+            for (var pDoc in qSnap.docs) {
+               double currentPurse = (pDoc.data()["purse"] ?? 1000000000).toDouble();
+               if (pDoc.data()["team"] == _highestBidder) {
+                  currentPurse = currentPurse - _currentBid;
+                  pDoc.reference.update({"purse": currentPurse});
+               }
+               
+               // Check if any team still has significant purse left
+               // Using a threshold like 5 million to account for small remaining amounts
+               if (currentPurse > 5000000) { 
+                  allPursesEmpty = false;
+               }
+            }
+            
+            // If all purses are empty and this is the host, end the auction
+            if (allPursesEmpty && widget.isHost) {
+               FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
+            }
+         });
+         
+         // Save to sold subcollection
+         FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").doc(_currentPlayerId).set({
+            "name": _currentPlayerName,
               "team": _highestBidder,
               "price": _currentBid,
               "basePrice": _currentPlayerBasePrice,
@@ -178,6 +255,8 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     _spotlightController.dispose();
     _playerNameController.dispose();
     _chatController.dispose();
+    _tabController.dispose(); // Dispose the TabController
+    _roomSubscription?.cancel(); // Cancel the stream subscription
     super.dispose();
   }
 
@@ -209,11 +288,42 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       "team": _selectedTeam,
       "playerName": _playerName,
       "timestamp": FieldValue.serverTimestamp(),
+      "purse": 1000000000, // Starting purse for each team
     });
 
     setState(() {
       _hasJoined = true;
     });
+  }
+
+  Future<void> _handleExit() async {
+    if (widget.isHost) {
+      bool? confirm = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          backgroundColor: const Color(0xFF1E1005),
+          title: const Text("End Auction?", style: TextStyle(color: Colors.white)),
+          content: const Text("Leaving will end the auction for all participants.", style: TextStyle(color: Colors.white70)),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text("Cancel", style: TextStyle(color: Colors.white70)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text("End Auction", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+      if (confirm == true) {
+        await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
+        if (mounted) Navigator.of(context).pop();
+      }
+    } else {
+      Navigator.of(context).pop();
+    }
   }
 
   void _startAuction() async {
@@ -261,6 +371,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
 
   void _placeBid(int amount) {
     if (_sold || !_auctionStarted) return;
+    if (_highestBidder.isNotEmpty && _highestBidder == _selectedTeam) return;
     
     int newBid = _currentBid + amount;
     
@@ -285,8 +396,12 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   
   void _sendChat() {
     if (_chatController.text.isEmpty) return;
+    
+    FocusScope.of(context).unfocus(); // Close the keyboard
+    
     FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").add({
-       "text": "$_playerName: ${_chatController.text}",
+       "text": _chatController.text,
+       "senderName": _playerName,
        "timestamp": FieldValue.serverTimestamp(),
        "type": "chat",
     });
@@ -295,9 +410,15 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF0F0A06), 
-      resizeToAvoidBottomInset: true,
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _handleExit();
+      },
+      child: Scaffold(
+        backgroundColor: const Color(0xFF0F0A06), 
+        resizeToAvoidBottomInset: true,
       body: Stack(
         children: [
           _buildBackground(),
@@ -325,7 +446,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
             ),
         ],
       ),
-    );
+    ));
   }
 
   Widget _buildBackground() {
@@ -485,7 +606,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              IconButton(icon: const Icon(Icons.exit_to_app, color: Colors.white54), onPressed: () => Navigator.pop(context)),
+              IconButton(icon: const Icon(Icons.exit_to_app, color: Colors.white54), onPressed: _handleExit),
               Expanded(
                 child: FittedBox(
                   fit: BoxFit.scaleDown,
@@ -529,7 +650,6 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
               mainAxisAlignment: MainAxisAlignment.center,
               children: docs.map((d) {
                 String team = d["team"] ?? "";
-                String pName = d["playerName"] ?? "";
                 bool isHighest = team == _highestBidder;
                 List<Color> c = teamColors[team] ?? [Colors.grey, Colors.blueGrey];
 
@@ -552,9 +672,9 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                         ),
                       ),
                       const SizedBox(height: 4),
-                      SizedBox(
+                       SizedBox(
                         width: 60,
-                        child: Text(pName, style: const TextStyle(color: Colors.white70, fontSize: 10, fontWeight: FontWeight.bold), textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        child: Text("₹${((d.data() as Map<String, dynamic>).containsKey('purse') ? d['purse'] / 10000000 : 100.0).toStringAsFixed(1)} Cr", style: const TextStyle(color: Color(0xFFFFD700), fontSize: 10, fontWeight: FontWeight.bold), textAlign: TextAlign.center, maxLines: 1),
                       ),
                     ],
                   ),
@@ -599,7 +719,13 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                          decoration: BoxDecoration(
                            color: Colors.black, shape: BoxShape.circle,
                            border: Border.all(color: const Color(0xFFFFD700), width: 2),
-                           image: DecorationImage(image: NetworkImage(_currentPlayerImage.isNotEmpty ? _currentPlayerImage : "https://via.placeholder.com/150"), fit: BoxFit.cover),
+                         ),
+                         child: ClipOval(
+                           child: Image.network(
+                             _currentPlayerImage.isNotEmpty ? _currentPlayerImage : "https://via.placeholder.com/150",
+                             fit: BoxFit.cover,
+                             errorBuilder: (context, error, stackTrace) => const Icon(Icons.person, color: Colors.white54, size: 50),
+                           ),
                          ),
                        ),
                        const SizedBox(height: 12),
@@ -690,16 +816,17 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   }
 
   Widget _buildBidButton(String label, int amount) {
+    bool isHighest = _highestBidder == _selectedTeam && _selectedTeam.isNotEmpty;
     return InkWell(
-      onTap: () => _placeBid(amount),
+      onTap: isHighest ? null : () => _placeBid(amount),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
         decoration: BoxDecoration(
-           color: const Color(0xFFFFD700),
+           color: isHighest ? Colors.grey : const Color(0xFFFFD700),
            borderRadius: BorderRadius.circular(8),
-           boxShadow: const [BoxShadow(color: Color(0x66FFD700), blurRadius: 5)],
+           boxShadow: isHighest ? const [] : const [BoxShadow(color: Color(0x66FFD700), blurRadius: 5)],
         ),
-        child: Text(label, style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 12)),
+        child: Text(label, style: TextStyle(color: isHighest ? Colors.white54 : Colors.black, fontWeight: FontWeight.bold, fontSize: 12)),
       ),
     );
   }
@@ -751,26 +878,30 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 15, offset: Offset(0, -5))],
       ),
       child: DefaultTabController(
-        length: 4,
+        length: 5,
         child: Column(
           children: [
-            const TabBar(
+            TabBar( // Use the class's _tabController
+              controller: _tabController,
               indicatorColor: Color(0xFFFFD700), labelColor: Color(0xFFFFD700), unselectedLabelColor: Colors.white54,
               labelStyle: TextStyle(fontWeight: FontWeight.bold, fontSize: 12), isScrollable: true,
               tabs: [
                 Tab(text: "ACTIVITY", icon: Icon(Icons.chat_bubble_outline, size: 18)),
                 Tab(text: "STATS", icon: Icon(Icons.bar_chart, size: 18)),
                 Tab(text: "SQUAD", icon: Icon(Icons.shield_outlined, size: 18)),
+                Tab(text: "RESULTS", icon: Icon(Icons.leaderboard_outlined, size: 18)),
                 Tab(text: "SETTINGS", icon: Icon(Icons.settings_outlined, size: 18)),
               ],
             ),
             const Divider(height: 1, color: Colors.white12),
             Expanded(
               child: TabBarView(
+                controller: _tabController, // Use the class's _tabController
                 children: [
                   _buildActivityTab(),
                   _buildStatsTab(),
                   _buildSquadTab(),
+                  _buildResultsTab(),
                   _buildSettingsTab(),
                 ],
               ),
@@ -781,15 +912,132 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     );
   }
 
+  Widget _buildResultsTab() {
+    return StreamBuilder<DocumentSnapshot>(
+      stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).snapshots(),
+      builder: (context, roomSnap) {
+         if (!roomSnap.hasData) return const Center(child: CircularProgressIndicator());
+         var roomStatus = (roomSnap.data!.data() as Map<String, dynamic>)["status"] ?? "live";
+         
+         if (roomStatus != "ended") {
+            return const Center(
+               child: Text("Results will appear once the auction ends.", style: TextStyle(color: Colors.white54, fontSize: 16)),
+            );
+         }
+      
+         return StreamBuilder<QuerySnapshot>(
+            stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").snapshots(),
+            builder: (context, snapshot) {
+              if (!snapshot.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFFFFD700)));
+              
+              var soldDocs = snapshot.data!.docs;
+              Map<String, List<Map<String, dynamic>>> teamPlayers = {};
+              
+              for (var doc in soldDocs) {
+                var data = doc.data() as Map<String, dynamic>;
+                String team = data["team"] ?? "";
+                if (teamPlayers[team] == null) teamPlayers[team] = [];
+                teamPlayers[team]!.add(data);
+              }
+              
+              List<Map<String, dynamic>> teamRankings = [];
+              
+              for (String team in iplTeams) {
+                List<Map<String, dynamic>> players = teamPlayers[team] ?? [];
+                // Only include teams that have bought players
+                if (players.isEmpty) continue; 
+                
+                int totalRating = 0;
+                int batters = 0, bowlers = 0, allRounders = 0;
+                int totalSpent = 0;
+                
+                for (var p in players) {
+                  String role = (p["role"] ?? "").toString().toLowerCase();
+                  int price = p["price"] ?? 0;
+                  totalSpent += price;
+                  
+                  totalRating += (price / 1000000).ceil(); 
+                  
+                  if (role.contains("bat")) batters++;
+                  else if (role.contains("bowl")) bowlers++;
+                  else if (role.contains("all") || role.contains("round")) allRounders++;
+                }
+                
+                if (batters >= 3 && bowlers >= 3 && allRounders >= 2) {
+                   totalRating += 50; 
+                }
+                
+                int remainingPurse = 1000000000 - totalSpent; 
+                
+                teamRankings.add({
+                  "team": team,
+                  "players": players.length,
+                  "rating": totalRating,
+                  "purse": remainingPurse,
+                  "balanceBonus": batters >= 3 && bowlers >= 3 && allRounders >= 2
+                });
+              }
+              
+              teamRankings.sort((a, b) {
+                if (b["rating"] != a["rating"]) {
+                  return b["rating"].compareTo(a["rating"]);
+                }
+                return b["purse"].compareTo(a["purse"]);
+              });
+              
+              if (teamRankings.isEmpty) return const Center(child: Text("No players sold yet.", style: TextStyle(color: Colors.white54)));
+              
+              return ListView.builder(
+                padding: const EdgeInsets.all(16),
+                itemCount: teamRankings.length,
+                itemBuilder: (context, index) {
+                  var tr = teamRankings[index];
+                  bool hasBonus = tr["balanceBonus"];
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(color: Colors.white.withOpacity(0.05), borderRadius: BorderRadius.circular(12), border: Border.all(color: index == 0 ? const Color(0xFFFFD700) : Colors.white12)),
+                    child: Row(
+                      children: [
+                         Text("#${index + 1}", style: TextStyle(color: index == 0 ? const Color(0xFFFFD700) : Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
+                         const SizedBox(width: 12),
+                         Expanded(
+                           child: Column(
+                             crossAxisAlignment: CrossAxisAlignment.start,
+                             children: [
+                                Row(
+                                  children: [
+                                     Text(tr["team"], style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                                     if (hasBonus) const Padding(padding: EdgeInsets.only(left: 4), child: Icon(Icons.star, color: Colors.green, size: 12)),
+                                  ]
+                                ),
+                                const SizedBox(height: 4),
+                                Text("${tr["players"]} Players • Rating: ${tr["rating"]}", style: const TextStyle(color: Colors.blueAccent, fontSize: 10)),
+                             ],
+                           ),
+                         ),
+                         Text("₹${(tr["purse"]/10000000).toStringAsFixed(2)} Cr", style: const TextStyle(color: Color(0xFFDAA520), fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  );
+                },
+              );
+            },
+          );
+      },
+    );
+  }
+
   Widget _buildActivityTab() {
     return Column(
       children: [
         Expanded(
           child: StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").orderBy("timestamp", descending: true).limit(5).snapshots(),
+            stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").orderBy("timestamp", descending: false).snapshots(),
             builder: (context, snapshot) {
               if (!snapshot.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFFFFD700)));
-              var docs = snapshot.data!.docs.reversed.toList();
+              var docs = snapshot.data!.docs;
+              
+              // Auto scroll to bottom trick if needed without ScrollController: wrap in reverse ListView
               return ListView.builder(
                 padding: const EdgeInsets.all(16),
                 itemCount: docs.length,
@@ -797,17 +1045,58 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                   var data = docs[index].data() as Map<String, dynamic>;
                   String text = data["text"] ?? "";
                   String type = data["type"] ?? "system";
+                  String senderName = data["senderName"] ?? "";
+                  Timestamp? ts = data["timestamp"] as Timestamp?;
+                  String timeString = ts != null ? "${ts.toDate().hour.toString().padLeft(2, '0')}:${ts.toDate().minute.toString().padLeft(2, '0')}" : "";
                   
-                  Color bgColor; Color textColor;
-                  if (type == "bid") { bgColor = const Color(0xFFDAA520).withOpacity(0.2); textColor = const Color(0xFFFFD700); } 
-                  else if (type == "system") { bgColor = Colors.white.withOpacity(0.05); textColor = Colors.white54; } 
-                  else { bgColor = const Color(0xFF4169E1).withOpacity(0.2); textColor = Colors.white; }
+                  bool isMe = senderName == _playerName && type == "chat";
+                  
+                  if (type == "system" || type == "bid") {
+                    return Center(
+                      child: Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        decoration: BoxDecoration(color: type == "bid" ? const Color(0xFFDAA520).withOpacity(0.2) : Colors.white.withOpacity(0.1), borderRadius: BorderRadius.circular(20), border: Border.all(color: type == "bid" ? const Color(0xFFFFD700).withOpacity(0.5) : Colors.white24)),
+                        child: Text(text, style: TextStyle(color: type == "bid" ? const Color(0xFFFFD700) : Colors.white70, fontSize: 11, fontStyle: FontStyle.italic)),
+                      )
+                    );
+                  }
 
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                    decoration: BoxDecoration(color: bgColor, borderRadius: BorderRadius.circular(12), border: Border.all(color: textColor.withOpacity(0.3))),
-                    child: Text(text, style: TextStyle(color: textColor, fontSize: 13)),
+                  return Align(
+                    alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                    child: Container(
+                      margin: const EdgeInsets.only(bottom: 12, left: 16, right: 16),
+                      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: isMe ? const Color(0xFF14532D).withOpacity(0.8) : const Color(0xFF2D2D2D).withOpacity(0.8), // WhatsApp dark green vs dark grey
+                        borderRadius: BorderRadius.only(
+                          topLeft: const Radius.circular(16),
+                          topRight: const Radius.circular(16),
+                          bottomLeft: Radius.circular(isMe ? 16 : 0),
+                          bottomRight: Radius.circular(isMe ? 0 : 16)
+                        ),
+                        border: Border.all(color: isMe ? Colors.greenAccent.withOpacity(0.3) : Colors.white24),
+                        boxShadow: const [BoxShadow(color: Colors.black26, offset: Offset(0, 2), blurRadius: 4)]
+                      ),
+                      child: Column(
+                        crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                        children: [
+                          if (!isMe) Text(senderName.isNotEmpty ? senderName : "Unknown", style: const TextStyle(color: Color(0xFFFFD700), fontSize: 10, fontWeight: FontWeight.bold)),
+                          if (!isMe) const SizedBox(height: 4),
+                          Text(text, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                          const SizedBox(height: 4),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(timeString, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 9)),
+                              if (isMe) const SizedBox(width: 4),
+                              if (isMe) const Icon(Icons.done_all, size: 12, color: Colors.blueAccent), // Fake read receipt
+                            ],
+                          )
+                        ],
+                      ),
+                    ),
                   );
                 },
               );
@@ -820,13 +1109,12 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
           decoration: const BoxDecoration(color: Colors.black54, border: Border(top: BorderSide(color: Colors.white12))),
           child: Row(
             children: [
-              IconButton(icon: const Icon(Icons.gif_box_outlined, color: Color(0xFFDAA520)), onPressed: (){}),
               Expanded(
                 child: TextField(
                   controller: _chatController,
                   style: const TextStyle(color: Colors.white, fontSize: 14),
                   decoration: InputDecoration(
-                    hintText: "Message the lobby...", hintStyle: const TextStyle(color: Colors.white38),
+                    hintText: "Type a message...", hintStyle: const TextStyle(color: Colors.white38),
                     filled: true, fillColor: Colors.white.withOpacity(0.05),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 0),
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(20), borderSide: BorderSide.none),
@@ -1024,18 +1312,35 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   }
 
   Widget _buildSquadTab() {
-    if (_selectedTeam.isEmpty || _selectedTeam == "Host") return const Center(child: Text("Hosts do not have a squad.", style: TextStyle(color: Colors.white54)));
-    
-    return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").where("team", isEqualTo: _selectedTeam).snapshots(),
-      builder: (context, snapshot) {
-        if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-        
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Text("Your Squad • $_selectedTeam", style: const TextStyle(color: Color(0xFFFFD700), fontWeight: FontWeight.bold, fontSize: 16)),
-            const SizedBox(height: 16),
+  if (_selectedTeam.isEmpty || _selectedTeam == "Host") return const Center(child: Text("Hosts do not have a squad.", style: TextStyle(color: Colors.white54)));
+  
+  return StreamBuilder<QuerySnapshot>(
+    stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").where("team", isEqualTo: _selectedTeam).snapshots(),
+    builder: (context, pSnapshot) {
+       double remainingPurse = 1000000000;
+       int totalPlayers = 0;
+       if (pSnapshot.hasData && pSnapshot.data!.docs.isNotEmpty) {
+           remainingPurse = (pSnapshot.data!.docs.first.data() as Map<String, dynamic>)["purse"]?.toDouble() ?? 1000000000;
+       }
+       
+      return StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").where("team", isEqualTo: _selectedTeam).snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+          
+          totalPlayers = snapshot.data!.docs.length;
+          
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text("Squad • $_selectedTeam", style: const TextStyle(color: Color(0xFFFFD700), fontWeight: FontWeight.bold, fontSize: 16)),
+                  Text("₹${(remainingPurse/10000000).toStringAsFixed(2)} Cr", style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 16)),
+                ]
+              ),
+              const SizedBox(height: 16),
             ...snapshot.data!.docs.map((doc) {
               var data = doc.data() as Map<String, dynamic>;
               return Container(
@@ -1061,6 +1366,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         );
       },
     );
+    });
   }
 
   Widget _buildSettingsTab() {
