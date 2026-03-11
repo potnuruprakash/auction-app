@@ -140,6 +140,7 @@ class _CreateRoomScreenState extends State<CreateRoomScreen> with TickerProvider
       "highestBidder": "",
       "player": "Virat Kohli", // Placeholder
       "sold": false,
+      "status": "waiting",
       "createdAt": FieldValue.serverTimestamp(),
     });
 
@@ -617,25 +618,11 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
                 ),
                 const SizedBox(height: 30),
 
-                // SECTION 2: RECENT LIVE AUCTIONS
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24.0),
-                  child: const Text(
-                    "Live Auction Rooms",
-                    style: TextStyle(
-                      color: Color(0xFFFFD700),
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 1.2,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
                 Expanded(
                   child: StreamBuilder<QuerySnapshot>(
                     stream: FirebaseFirestore.instance.collection("rooms")
-                        .where("status", isEqualTo: "live")
-                        .orderBy("createdAt", descending: true)
+                        .where("status", whereIn: ["waiting", "live"]) 
+                        // Firebase blocks combining whereIn + orderBy without unique indexes, so we sort locally!
                         .snapshots(),
                     builder: (context, snapshot) {
                       if (snapshot.connectionState == ConnectionState.waiting) {
@@ -643,63 +630,117 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
                       }
                       
                       if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-                        return const Center(
-                          child: Padding(
-                            padding: EdgeInsets.all(20.0),
-                            child: Text(
-                              "No live auctions available right now.",
-                              style: TextStyle(color: Colors.white54, fontSize: 16),
-                              textAlign: TextAlign.center,
-                            ),
+                        return Center(
+                          child: Text(
+                            "No auction rooms available.",
+                            style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 16),
                           ),
                         );
                       }
                       
                       var docs = snapshot.data!.docs.where((doc) {
                         var data = doc.data() as Map<String, dynamic>;
+                        String status = data["status"] ?? "waiting";
+                        if (status == "ended") return false; // Redundant safety net
+
                         String roomName = (data["roomName"] ?? "").toString().toLowerCase();
                         String roomCode = (data["roomCode"] ?? "").toString().toLowerCase();
                         return roomName.contains(_searchQuery) || roomCode.contains(_searchQuery);
                       }).toList();
 
+                      // Sort locally since Firebase indexing blocks combining where/orderBy directly
+                      docs.sort((a, b) {
+                         var aData = a.data() as Map<String, dynamic>;
+                         var bData = b.data() as Map<String, dynamic>;
+                         int aTime = (aData["createdAt"] as Timestamp?)?.millisecondsSinceEpoch ?? 0;
+                         int bTime = (bData["createdAt"] as Timestamp?)?.millisecondsSinceEpoch ?? 0;
+                         return bTime.compareTo(aTime); // descending
+                      });
+
+
+
                       if (docs.isEmpty) {
                         return Center(
                           child: Text(
-                            "No rooms match your search.",
+                            "No waiting or live rooms match your search.",
                             style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 16),
                           ),
                         );
                       }
 
-                      return ListView.builder(
-                        padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
-                        itemCount: docs.length,
-                        itemBuilder: (context, index) {
-                          var doc = docs[index];
-                          var data = doc.data() as Map<String, dynamic>;
-                          String roomName = data["roomName"] ?? "Auction Arena";
-                          bool isPrivate = data["isPrivate"] ?? false;
-                          String roomCode = data["roomCode"] ?? doc.id;
-                          String hostName = data["hostName"] ?? "Unknown Host";
-                          
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 16.0),
-                            child: _buildRoomCard(
-                              roomId: doc.id,
-                              roomName: roomName,
-                              isPrivate: isPrivate,
-                              hostName: hostName,
-                              onTap: () {
-                                if (isPrivate) {
-                                  _showPrivateRoomPopup(doc.id, roomCode, roomName);
-                                } else {
-                                  _joinPublicRoom(doc.id);
-                                }
-                              },
+                      var waitingDocs = docs.where((doc) => (doc.data() as Map<String, dynamic>)["status"] == "waiting").toList();
+                      var liveDocs = docs.where((doc) => (doc.data() as Map<String, dynamic>)["status"] == "live").toList();
+
+                      List<Widget> buildRoomList(List<QueryDocumentSnapshot> listDocs) {
+                          return listDocs.map((doc) {
+                              var data = doc.data() as Map<String, dynamic>;
+                              String roomName = data["roomName"] ?? "Auction Arena";
+                              bool isPrivate = data["isPrivate"] ?? false;
+                              String roomCode = data["roomCode"] ?? doc.id;
+                              String roomId = doc.id;
+                              String status = data["status"] ?? "waiting";
+                              
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 16.0),
+                                child: _buildRoomCard(
+                                  roomName: roomName,
+                                  hostName: data["hostName"] ?? "Unknown Host",
+                                  roomId: roomId,
+                                  isPrivate: isPrivate,
+                                  status: status,
+                                  onTap: () {
+                                    if (status != "waiting") {
+                                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Cannot join an auction that has already started.', style: TextStyle(color: Colors.white)), backgroundColor: Colors.red));
+                                      return;
+                                    }
+                                    
+                                    if (isPrivate) {
+                                      _showPrivateRoomPopup(roomId, roomCode, roomName);
+                                    } else {
+                                      _joinPublicRoom(roomId);
+                                    }
+                                  },
+                                ),
+                              );
+                          }).toList();
+                      }
+                    
+                    return ListView(
+                      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
+                      physics: const BouncingScrollPhysics(),
+                      children: [
+                        if (waitingDocs.isNotEmpty) ...[
+                          const Row(
+                            children: [
+                               Icon(Icons.circle, color: Colors.greenAccent, size: 12),
+                               SizedBox(width: 8),
+                               Text("Waiting Rooms (Joinable)", style: TextStyle(color: Color(0xFFFFD700), fontSize: 18, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          ...buildRoomList(waitingDocs),
+                          const SizedBox(height: 16),
+                        ],
+                        if (liveDocs.isNotEmpty) ...[
+                          const Row(
+                            children: [
+                               Icon(Icons.circle, color: Colors.redAccent, size: 12),
+                               SizedBox(width: 8),
+                               Text("Live Auction Rooms", style: TextStyle(color: Color(0xFFFFD700), fontSize: 18, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          ...buildRoomList(liveDocs),
+                        ],
+                        if (waitingDocs.isEmpty && liveDocs.isEmpty)
+                          Center(
+                            child: Text(
+                              "No live auctions match your search.",
+                              style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 16),
                             ),
-                          );
-                        },
-                      );
+                          )
+                      ],
+                    );
                     },
                   ),
                 ),
@@ -711,24 +752,27 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
     );
   }
 
-  Widget _buildRoomCard({required String roomId, required String roomName, required bool isPrivate, required String hostName, required VoidCallback onTap}) {
+  Widget _buildRoomCard({required String roomName, required String hostName, required String roomId, required bool isPrivate, required String status, required VoidCallback onTap}) {
+    bool isLive = status == "live";
     return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: [const Color(0xFF1E1E1E).withOpacity(0.8), const Color(0xFF121212).withOpacity(0.8)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+      onTap: isLive ? () {} : onTap,
+      child: Opacity(
+        opacity: isLive ? 0.6 : 1.0,
+        child: Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [const Color(0xFF1E1E1E).withOpacity(0.8), const Color(0xFF121212).withOpacity(0.8)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0xFFDAA520).withOpacity(0.3), width: 1),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 8, offset: const Offset(0, 4)),
+              const BoxShadow(color: Color(0x1ADAA520), blurRadius: 10, spreadRadius: -2),
+            ],
           ),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: const Color(0xFFDAA520).withOpacity(0.3), width: 1),
-          boxShadow: [
-            BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 8, offset: const Offset(0, 4)),
-            const BoxShadow(color: Color(0x1ADAA520), blurRadius: 10, spreadRadius: -2),
-          ],
-        ),
         child: Row(
           children: [
             Container(
@@ -745,65 +789,106 @@ class _JoinRoomScreenState extends State<JoinRoomScreen> with TickerProviderStat
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Expanded(
-                        child: Text(
-                          roomName,
-                          style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(color: Colors.green.withOpacity(0.2), borderRadius: BorderRadius.circular(4), border: Border.all(color: Colors.greenAccent)),
-                        child: const Text("LIVE", style: TextStyle(color: Colors.greenAccent, fontSize: 10, fontWeight: FontWeight.bold)),
-                      )
-                    ],
-                  ),
-                  const SizedBox(height: 4),
                   Text(
-                    "Room ID: $roomId",
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.5),
-                      fontSize: 12,
-                      letterSpacing: 0.8,
+                    roomName,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
                     ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 4),
                   Row(
-                    children: [
-                      const Icon(Icons.person, color: Color(0xFFFFD700), size: 14),
-                      const SizedBox(width: 4),
-                      Expanded(
-                        child: Text("Host: $hostName", style: const TextStyle(color: Colors.white70, fontSize: 14), overflow: TextOverflow.ellipsis),
-                      ),
-                    ],
+                     children: [
+                        const Icon(Icons.person, color: Colors.white54, size: 12),
+                        const SizedBox(width: 4),
+                        Text(hostName, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                     ]
                   ),
-                  const SizedBox(height: 4),
+                  const SizedBox(height: 6),
                   Row(
                     children: [
-                      const Icon(Icons.groups, color: Color(0xFFDAA520), size: 14),
-                      const SizedBox(width: 4),
-                      // Teams Joined Counter
-                      StreamBuilder<QuerySnapshot>(
-                        stream: FirebaseFirestore.instance.collection("rooms").doc(roomId).collection("participants").snapshots(),
-                        builder: (context, partSnap) {
-                          int count = partSnap.hasData ? partSnap.data!.docs.length : 0;
-                          return Text("Teams Joined: $count", style: const TextStyle(color: Colors.white54, fontSize: 12));
-                        }
+                      Text(
+                        isPrivate ? "PRIVATE" : "PUBLIC",
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.5),
+                          fontSize: 10,
+                          letterSpacing: 1.0,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Row(
+                        children: [
+                           const Icon(Icons.groups_2_outlined, color: Colors.blueAccent, size: 14),
+                           const SizedBox(width: 4),
+                           FutureBuilder<QuerySnapshot>(
+                              future: FirebaseFirestore.instance.collection("rooms").doc(roomId).collection("participants").get(),
+                              builder: (context, psnp) {
+                                 int count = psnp.hasData ? psnp.data!.docs.length : 0;
+                                 return Text("$count Joined", style: const TextStyle(color: Colors.blueAccent, fontSize: 10, fontWeight: FontWeight.bold));
+                              }
+                           )
+                        ]
+                      ),
+                      const SizedBox(width: 12),
+                      Row(
+                        children: [
+                          AnimatedBuilder(
+                            animation: _pulseController,
+                            builder: (context, child) {
+                              return Container(
+                                width: 8,
+                                height: 8,
+                                decoration: BoxDecoration(
+                                  color: isLive ? Colors.greenAccent : Colors.orangeAccent,
+                                  shape: BoxShape.circle,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: isLive ? Colors.greenAccent.withOpacity(0.6 * _pulseController.value) : Colors.orangeAccent.withOpacity(0.6 * _pulseController.value),
+                                      blurRadius: 8 * _pulseController.value,
+                                      spreadRadius: 2 * _pulseController.value,
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            isLive ? "LIVE" : "WAITING",
+                            style: TextStyle(color: isLive ? Colors.greenAccent : Colors.orangeAccent, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.0),
+                          ),
+                        ],
                       ),
                     ],
                   ),
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right, color: Color(0xFFDAA520), size: 28),
+            isLive 
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                       const Text("Auction already started", style: TextStyle(color: Colors.redAccent, fontSize: 8, fontWeight: FontWeight.bold)),
+                       const SizedBox(height: 8),
+                       Container(
+                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                         decoration: BoxDecoration(color: Colors.grey.withOpacity(0.3), borderRadius: BorderRadius.circular(8)),
+                         child: const Text("Disabled", style: TextStyle(color: Colors.white54, fontWeight: FontWeight.bold, fontSize: 12)),
+                       )
+                    ]
+                  )
+                : ElevatedButton(
+                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFFD700), foregroundColor: Colors.black, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)), padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12)),
+                    onPressed: onTap,
+                    child: const Text("JOIN", style: TextStyle(fontWeight: FontWeight.bold)),
+                  ),
           ],
         ),
+      ),
       ),
     );
   }

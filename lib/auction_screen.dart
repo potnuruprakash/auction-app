@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class AuctionScreen extends StatefulWidget {
   final String teamName;
@@ -21,6 +22,10 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   String _selectedTeam = "";
   String _playerName = "";
   final TextEditingController _playerNameController = TextEditingController();
+
+  double _myPurse = 1000000000;
+  StreamSubscription<DocumentSnapshot>? _myPurseSubscription;
+  String _upcomingSearchQuery = "";
 
   final List<String> iplTeams = [
     "MI", "CSK", "RCB", "KKR", "GT", "SRH", "RR", "DC", "PBKS", "LSG"
@@ -56,15 +61,22 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   String _currentPlayerNationality = "";
   String _currentPlayerImage = "https://via.placeholder.com/150";
   int _currentPlayerBasePrice = 0;
+  
+  String _lastProcessedSoldPlayerId = "";
 
   // Timer logic
   int _endTimeEpoch = 0;
   int _timerSetting = 30; // 30 sec by default
   int _remainingTime = 30;
   bool _auctionStarted = false;
+  bool _auctionRunning = true; // State to completely freeze processes on 'ended'
 
   final TextEditingController _chatController = TextEditingController();
   
+  bool _isExitingDialogVisible = false;
+  String _savedTeam = ''; // Populated when auto-reconnecting via SharedPreferences
+  bool _isReconnecting = false; // Suppress join UI while restoring state
+
   late TabController _tabController;
   StreamSubscription<DocumentSnapshot>? _roomSubscription;
 
@@ -81,34 +93,95 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     _listenToRoom();
     _listenToPlayers(); // New listener for player data
     _startLocalTimerSync();
+    _checkSavedSession(); // Reconnect check
   }
 
-  void _showAuctionEndedDialog() {
+  void _stopAuction() {
+      _auctionRunning = false;
+      _bgController.stop();
+      _spotlightController.stop();
+  }
+
+  // ─── RECONNECT SYSTEM ─────────────────────────────────────────────────────
+  Future<void> _checkSavedSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString('room_${widget.roomId}_team');
+    final savedName = prefs.getString('room_${widget.roomId}_name');
+    if (saved == null || savedName == null) return;
+
+    // Check if this team slot still exists in Firestore
+    final doc = await FirebaseFirestore.instance
+        .collection('rooms')
+        .doc(widget.roomId)
+        .collection('participants')
+        .doc(saved)
+        .get();
+
+    if (!doc.exists || !mounted) return;
+
+    final data = doc.data()!;
+    final status = data['status'] ?? 'online';
+
+    // Restore state immediately
+    setState(() {
+      _savedTeam = saved;
+      _selectedTeam = saved;
+      _playerName = savedName;
+      _myPurse = (data['purse'] ?? 1000000000).toDouble();
+      _isReconnecting = status == 'offline'; // true = was offline before
+    });
+
+    // Mark back online
+    await doc.reference.update({'status': 'online'});
+
+    // Post reconnect activity message only if they were previously offline
+    if (_isReconnecting) {
+      FirebaseFirestore.instance
+          .collection('rooms')
+          .doc(widget.roomId)
+          .collection('activity')
+          .add({
+        'text': '$savedName rejoined the auction room',
+        'timestamp': FieldValue.serverTimestamp(),
+        'type': 'system',
+      });
+    }
+
+    // Start listening to purse changes
+    _myPurseSubscription = FirebaseFirestore.instance
+        .collection('rooms')
+        .doc(widget.roomId)
+        .collection('participants')
+        .doc(saved)
+        .snapshots()
+        .listen((snap) {
+      if (snap.exists && mounted) {
+        setState(() {
+          _myPurse = (snap.data()?['purse'] ?? 1000000000).toDouble();
+        });
+      }
+    });
+
+    // Bypass the join screen
+    if (mounted) {
+      setState(() {
+        _hasJoined = true;
+        _isReconnecting = false;
+      });
+    }
+  }
+
+  void _showAuctionEndedDialog(bool hostLeft) {
+      _stopAuction();
+      
       // Force UI to show Results tab (Index 3, as per the current TabBar structure)
       if (_tabController != null) {
-         _tabController.animateTo(3); // Changed index to 3 based on current TabBar
+         _tabController.animateTo(3); 
       }
       
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          backgroundColor: const Color(0xFF1E1005),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: const BorderSide(color: Color(0xFFDAA520))),
-          title: const Text("Auction Ended", style: TextStyle(color: Color(0xFFFFD700), fontWeight: FontWeight.bold)),
-          content: const Text("The session has concluded. Redirecting to final results.", style: TextStyle(color: Colors.white)),
-          actions: [
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFFD700), foregroundColor: Colors.black),
-              onPressed: () => Navigator.pop(context), 
-              child: const Text("View Results")
-            ),
-            TextButton(
-               onPressed: () { Navigator.pop(context); Navigator.pop(context); }, 
-               child: const Text("Exit Room", style: TextStyle(color: Colors.white54))
-            )
-          ]
-        )
+      String msg = hostLeft ? "Auction ended. Host left the room." : "The auction has formally concluded.";
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg, style: const TextStyle(color: Colors.white)), backgroundColor: Colors.red, duration: const Duration(seconds: 4))
       );
   }
 
@@ -132,6 +205,13 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
           _timerSetting = data["timerSetting"] ?? 30;
           _endTimeEpoch = data["endTimeEpoch"] ?? 0;
         });
+
+        if (_sold && _currentPlayerId.isNotEmpty && _currentPlayerId != _lastProcessedSoldPlayerId) {
+           _lastProcessedSoldPlayerId = _currentPlayerId;
+           WidgetsBinding.instance.addPostFrameCallback((_) {
+               _showSoldUnsoldDialog();
+           });
+        }
       }
     });
   }
@@ -144,7 +224,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         
         // Host Exit / Status Ended Check
         if (data["status"] == "ended") {
-           _showAuctionEndedDialog();
+           _showAuctionEndedDialog(data["hostActive"] == false);
         } else {
            setState(() {
              // These are already handled by _listenToPlayers, but keeping for robustness if _listenToPlayers is delayed
@@ -159,7 +239,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   void _startLocalTimerSync() {
     Future.doWhile(() async {
       await Future.delayed(const Duration(milliseconds: 500));
-      if (!mounted) return false;
+      if (!mounted || !_auctionRunning) return false;
       
       if (_auctionStarted && !_sold && _endTimeEpoch > 0) {
         int now = DateTime.now().millisecondsSinceEpoch;
@@ -195,9 +275,9 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
        });
 
        if (!isUnsold && _currentPlayerId.isNotEmpty) {
-         // Deduct purse and Check for Auto-End Condition
+          // Deduct purse and Check for Auto-End Condition
          FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").get().then((qSnap) async {
-            bool allPursesEmpty = true;
+            bool allPursesEmpty = qSnap.docs.isNotEmpty; // Prevent solo rooms from auto-ending falsely
             
             for (var pDoc in qSnap.docs) {
                double currentPurse = (pDoc.data()["purse"] ?? 1000000000).toDouble();
@@ -206,14 +286,13 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                   pDoc.reference.update({"purse": currentPurse});
                }
                
-               // Check if any team still has significant purse left
-               // Using a threshold like 5 million to account for small remaining amounts
-               if (currentPurse > 5000000) { 
+               // Check if any team has enough purse to make a minimum bid (20 Lakhs)
+               if (currentPurse >= 2000000) { 
                   allPursesEmpty = false;
                }
             }
             
-            // If all purses are empty and this is the host, end the auction
+            // If all purses are effectively empty and this is the host, end the auction automatically
             if (allPursesEmpty && widget.isHost) {
                FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
             }
@@ -241,12 +320,44 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
        }
     }
 
-    // Automatically select next player after 4 seconds
-    if (widget.isHost) {
-      Future.delayed(const Duration(seconds: 4), () {
-        if (mounted) _startAuction();
-      });
-    }
+  }
+
+  void _showSoldUnsoldDialog() {
+    if (_isExitingDialogVisible || !_auctionRunning) return; // Suppress backgrounds from randomly overriding Host exit attempt
+
+    bool isUnsold = _highestBidder.isEmpty;
+    showDialog(
+      context: context,
+      barrierColor: Colors.black87,
+      barrierDismissible: false,
+      builder: (context) {
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (!isUnsold) ...[
+                const Text("SOLD", style: TextStyle(color: Colors.redAccent, fontSize: 64, fontWeight: FontWeight.w900, letterSpacing: 8, shadows: [Shadow(color: Colors.black, blurRadius: 20, offset: Offset(0, 5))])),
+                const SizedBox(height: 16),
+                Text("To $_highestBidder", style: const TextStyle(color: Color(0xFFFFD700), fontSize: 32, fontWeight: FontWeight.bold, letterSpacing: 4)),
+              ] else ...[
+                const Text("UNSOLD", style: TextStyle(color: Colors.grey, fontSize: 64, fontWeight: FontWeight.w900, letterSpacing: 8, shadows: [Shadow(color: Colors.black, blurRadius: 20, offset: Offset(0, 5))])),
+              ]
+            ],
+          ),
+        );
+      }
+    );
+
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        Navigator.pop(context); // Close dialog
+        if (widget.isHost) {
+          _startAuction(); // Fetch next
+        }
+      }
+    });
   }
 
   @override
@@ -257,6 +368,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     _chatController.dispose();
     _tabController.dispose(); // Dispose the TabController
     _roomSubscription?.cancel(); // Cancel the stream subscription
+    _myPurseSubscription?.cancel();
     super.dispose();
   }
 
@@ -268,15 +380,27 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
 
     HapticFeedback.heavyImpact();
     
-    // Double validation protection
-    var doc = await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").doc(_selectedTeam).get();
-    if (doc.exists && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Team already selected by another player', style: TextStyle(color: Colors.white)), backgroundColor: Colors.red));
-      setState(() => _selectedTeam = "");
-      return;
+    // Double validation — block if slot is already active/taken by someone else
+    var doc = await FirebaseFirestore.instance
+        .collection("rooms").doc(widget.roomId)
+        .collection("participants").doc(_selectedTeam).get();
+    if (doc.exists) {
+      final Map<String, dynamic> slotData = Map<String, dynamic>.from(doc.data() as Map);
+      final existingStatus = slotData['status'] ?? 'online';
+      // Block if the slot belongs to an active online player on a different device
+      if (existingStatus == 'online' && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Team already selected by another player', style: TextStyle(color: Colors.white)), backgroundColor: Colors.red));
+        setState(() => _selectedTeam = "");
+        return;
+      }
     }
 
     _playerName = _playerNameController.text;
+
+    // Persist session for auto-reconnect
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('room_${widget.roomId}_team', _selectedTeam);
+    await prefs.setString('room_${widget.roomId}_name', _playerName);
 
     FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").add({
        "text": "$_playerName joined as $_selectedTeam",
@@ -289,39 +413,91 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       "playerName": _playerName,
       "timestamp": FieldValue.serverTimestamp(),
       "purse": 1000000000, // Starting purse for each team
+      "status": "online",
     });
+
+    if (widget.isHost) {
+      FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({
+        "hostName": _playerName,
+      });
+    }
 
     setState(() {
       _hasJoined = true;
     });
+
+    // Start listening to my purse
+    _myPurseSubscription = FirebaseFirestore.instance
+        .collection("rooms")
+        .doc(widget.roomId)
+        .collection("participants")
+        .doc(_selectedTeam)
+        .snapshots()
+        .listen((snap) {
+      if (snap.exists && mounted) {
+        setState(() {
+          _myPurse = (snap.data()?["purse"] ?? 1000000000).toDouble();
+        });
+      }
+    });
   }
 
   Future<void> _handleExit() async {
+    // If the auction has formally ended, just let them leave!
+    if (!_auctionRunning) {
+       Navigator.of(context).pop();
+       return;
+    }
+
     if (widget.isHost) {
+      setState(() => _isExitingDialogVisible = true);
       bool? confirm = await showDialog<bool>(
         context: context,
-        builder: (context) => AlertDialog(
-          backgroundColor: const Color(0xFF1E1005),
-          title: const Text("End Auction?", style: TextStyle(color: Colors.white)),
-          content: const Text("Leaving will end the auction for all participants.", style: TextStyle(color: Colors.white70)),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text("Cancel", style: TextStyle(color: Colors.white70)),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text("End Auction", style: TextStyle(color: Colors.white)),
-            ),
-          ],
+        builder: (context) => BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+          child: AlertDialog(
+            backgroundColor: const Color(0xFF1E1005),
+            title: const Text("End Auction?", style: TextStyle(color: Colors.white)),
+            content: const Text("Leaving will end the auction for all participants.", style: TextStyle(color: Colors.white70)),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text("Cancel", style: TextStyle(color: Colors.white70)),
+              ),
+              ElevatedButton(
+                 style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                 onPressed: () => Navigator.of(context).pop(true),
+                 child: const Text("End Auction", style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          ),
         ),
       );
+      setState(() => _isExitingDialogVisible = false);
       if (confirm == true) {
-        await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
-        if (mounted) Navigator.of(context).pop();
+        await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended", "hostActive": false});
+        // Listener natively catches "ended" and pushes Host to Results immediately! 
       }
     } else {
+      // ── Non-host: mark offline instead of disconnecting ──
+      if (_selectedTeam.isNotEmpty) {
+        await FirebaseFirestore.instance
+            .collection('rooms')
+            .doc(widget.roomId)
+            .collection('participants')
+            .doc(_selectedTeam)
+            .update({'status': 'offline'});
+        
+        FirebaseFirestore.instance
+            .collection('rooms')
+            .doc(widget.roomId)
+            .collection('activity')
+            .add({
+          'text': '$_playerName left the auction room',
+          'timestamp': FieldValue.serverTimestamp(),
+          'type': 'system',
+        });
+      }
       Navigator.of(context).pop();
     }
   }
@@ -337,16 +513,12 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     List<QueryDocumentSnapshot> available = playersSnap.docs.where((p) => !processedIds.contains(p.id)).toList();
 
     if (available.isEmpty) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("No more players available! Ending Auction...")));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("No more players available in the pool. Auction automatically concluded.")));
+        FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
+      }
+      return;
     }
-    
-    // Auto-End Condition: No players remaining
-    if (widget.isHost) {
-       FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
-    }
-    return;
-  }
 
     // 2. Randomly select one
     var randomPlayer = available[Random().nextInt(available.length)];
@@ -355,6 +527,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     // 3. Update room
     FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({
       "auctionStarted": true,
+      "status": "live",
       "currentPlayerId": randomPlayer.id,
       "currentPlayerName": data["name"] ?? "Unknown",
       "currentPlayerRole": data["role"] ?? "Unknown",
@@ -379,6 +552,11 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     if (_highestBidder.isNotEmpty && _highestBidder == _selectedTeam) return;
     
     int newBid = _currentBid + amount;
+    
+    if (newBid > _myPurse) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Insufficient purse balance', style: TextStyle(color: Colors.white)), backgroundColor: Colors.red));
+      return;
+    }
     
     FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({
       "currentBid": newBid,
@@ -405,11 +583,12 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
     FocusScope.of(context).unfocus(); // Close the keyboard
     
     FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").add({
-       "text": _chatController.text,
-       "senderName": _playerName,
-       "timestamp": FieldValue.serverTimestamp(),
-       "type": "chat",
-    });
+     "text": _chatController.text,
+     "senderName": _playerName,
+     "team": _selectedTeam,
+     "timestamp": FieldValue.serverTimestamp(),
+     "type": "chat",
+  });
     _chatController.clear();
   }
 
@@ -431,24 +610,6 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
           SafeArea(
             child: !_hasJoined ? _buildJoinPopup() : _buildMainLobby(),
           ),
-          
-          // Confetti / Sold Badge Overlay
-          if (_sold && _hasJoined && _auctionStarted && _currentPlayerName != "Waiting for Host...")
-            IgnorePointer(
-               child: Container(
-                  color: Colors.black54,
-                  child: Center(
-                     child: Column(
-                       mainAxisSize: MainAxisSize.min,
-                       children: [
-                         const Text("SOLD", style: TextStyle(color: Colors.redAccent, fontSize: 64, fontWeight: FontWeight.w900, letterSpacing: 8, shadows: [Shadow(color: Colors.black, blurRadius: 20, offset: Offset(0, 5))])),
-                         const SizedBox(height: 16),
-                         Text(_highestBidder.isNotEmpty ? "To $_highestBidder" : "UNSOLD", style: const TextStyle(color: Color(0xFFFFD700), fontSize: 32, fontWeight: FontWeight.bold, letterSpacing: 4)),
-                       ],
-                     ),
-                  ),
-               ),
-            ),
         ],
       ),
     ));
@@ -634,14 +795,17 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         const SizedBox(height: 8),
 
         Expanded(flex: 4, child: _buildAuctionStage()),
+        const SizedBox(height: 8),
         Expanded(flex: 5, child: _buildInteractionPanel()),
       ],
     );
   }
 
+
+
   Widget _buildActiveParticipantsRow() {
     return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").orderBy("timestamp").limit(5).snapshots(),
+      stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").orderBy("timestamp").limit(10).snapshots(),
       builder: (context, snapshot) {
         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) return const SizedBox.shrink();
         
@@ -656,32 +820,56 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
               children: docs.map((d) {
                 String team = d["team"] ?? "";
                 bool isHighest = team == _highestBidder;
+                bool isOnline = (d.data() as Map<String, dynamic>)['status'] != 'offline';
                 List<Color> c = teamColors[team] ?? [Colors.grey, Colors.blueGrey];
 
                 return Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 10.0),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      AnimatedContainer(
-                        duration: const Duration(milliseconds: 300),
-                        width: 55, height: 55,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: LinearGradient(colors: c),
-                          border: Border.all(color: isHighest ? Colors.white : Colors.transparent, width: isHighest ? 3 : 0),
-                          boxShadow: [BoxShadow(color: c[0].withOpacity(isHighest ? 0.8 : 0.4), blurRadius: isHighest ? 15 : 8, spreadRadius: isHighest ? 4 : 1)],
+                  child: Opacity(
+                    opacity: isOnline ? 1.0 : 0.45,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Stack(
+                          clipBehavior: Clip.none,
+                          children: [
+                            AnimatedContainer(
+                              duration: const Duration(milliseconds: 300),
+                              width: 55, height: 55,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                gradient: LinearGradient(colors: c),
+                                border: Border.all(color: isHighest ? Colors.white : Colors.transparent, width: isHighest ? 3 : 0),
+                                boxShadow: [BoxShadow(color: c[0].withValues(alpha: isHighest ? 0.8 : 0.4), blurRadius: isHighest ? 15 : 8, spreadRadius: isHighest ? 4 : 1)],
+                              ),
+                              child: Center(
+                                child: Text(team, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
+                              ),
+                            ),
+                            // Online/Offline status dot
+                            Positioned(
+                              bottom: 0, right: 0,
+                              child: Container(
+                                width: 13, height: 13,
+                                decoration: BoxDecoration(
+                                  color: isOnline ? Colors.greenAccent : Colors.redAccent,
+                                  shape: BoxShape.circle,
+                                  border: Border.all(color: const Color(0xFF1E1005), width: 2),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                        child: Center(
-                          child: Text(team, style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 3),
+                        Text(
+                          isOnline ? 'Online' : 'Away',
+                          style: TextStyle(
+                            color: isOnline ? Colors.greenAccent : Colors.redAccent,
+                            fontSize: 9, fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 4),
-                       SizedBox(
-                        width: 60,
-                        child: Text("₹${((d.data() as Map<String, dynamic>).containsKey('purse') ? d['purse'] / 10000000 : 100.0).toStringAsFixed(1)} Cr", style: const TextStyle(color: Color(0xFFFFD700), fontSize: 10, fontWeight: FontWeight.bold), textAlign: TextAlign.center, maxLines: 1),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 );
               }).toList(),
@@ -691,6 +879,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       },
     );
   }
+
 
   Widget _buildAuctionStage() {
     return Container(
@@ -779,39 +968,6 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                           ],
                         ),
                       ),
-                      Expanded(
-                        child: StreamBuilder<DocumentSnapshot>(
-                          stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).snapshots(),
-                          builder: (context, snapshot) {
-                             if (!snapshot.hasData) return const SizedBox.shrink();
-                             var data = snapshot.data!.data() as Map<String, dynamic>;
-                             bool isSold = data["sold"] ?? false;
-                             String highest = data["highestBidder"] ?? "";
-                             int currentBid = data["currentBid"] ?? 0;
-                             
-                             if (isSold) {
-                                if (highest.isNotEmpty) {
-                                   return FittedBox(
-                                     fit: BoxFit.scaleDown,
-                                     child: Text(
-                                       "SOLD to $highest for ₹${(currentBid / 10000000).toStringAsFixed(2)} Cr",
-                                       style: const TextStyle(color: Colors.redAccent, fontSize: 40, fontWeight: FontWeight.bold, letterSpacing: 2),
-                                     ),
-                                   );
-                                } else {
-                                   return const FittedBox(
-                                     fit: BoxFit.scaleDown,
-                                     child: Text(
-                                       "UNSOLD",
-                                       style: TextStyle(color: Colors.grey, fontSize: 40, fontWeight: FontWeight.bold, letterSpacing: 2),
-                                     ),
-                                   );
-                                }
-                             }
-                             return const SizedBox.shrink();
-                          }
-                        ),
-                      ),   
                       const SizedBox(width: 8),
                       // Bid Action Bar
                       if (_auctionStarted && !_sold)
@@ -837,11 +993,21 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                    minHeight: 6,
                    borderRadius: BorderRadius.circular(3),
                  ),
-                 const SizedBox(height: 8),
                  Row(
                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                    children: [
-                     Text("Status: ${_sold ? (_highestBidder.isNotEmpty ? 'SOLD' : 'UNSOLD') : (_auctionStarted ? 'LIVE' : 'WAITING')}", style: TextStyle(color: _sold ? (_highestBidder.isNotEmpty ? Colors.red : Colors.grey) : Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold)),
+                     StreamBuilder<DocumentSnapshot>(
+                        stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").doc(_selectedTeam).snapshots(),
+                        builder: (context, snapshot) {
+                           double displayPurse = 1000000000;
+                           if (snapshot.hasData && snapshot.data!.exists) {
+                              var data = snapshot.data!.data() as Map<String, dynamic>;
+                              displayPurse = (data["purse"] ?? 1000000000).toDouble();
+                           }
+                           return Text("Purse Remaining: ₹${(displayPurse / 10000000).toStringAsFixed(1)} Cr", style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 12));
+                        }
+                     ),
+                     Text("Status: ${_sold ? 'SOLD' : (_auctionStarted ? 'LIVE' : 'WAITING')}", style: TextStyle(color: _sold ? Colors.red : Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold)),
                    ],
                  )
                ],
@@ -854,16 +1020,23 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
 
   Widget _buildBidButton(String label, int amount) {
     bool isHighest = _highestBidder == _selectedTeam && _selectedTeam.isNotEmpty;
+    bool notEnoughPurse = (_currentBid + amount) > _myPurse;
+    bool isDisabled = isHighest || _myPurse <= 0 || notEnoughPurse || _currentPlayerBasePrice > _myPurse;
+
     return InkWell(
-      onTap: isHighest ? null : () => _placeBid(amount),
+      onTap: isDisabled ? () {
+        if (!isHighest && (notEnoughPurse || _currentPlayerBasePrice > _myPurse)) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Not enough purse to bid for this player', style: TextStyle(color: Colors.white)), backgroundColor: Colors.red));
+        }
+      } : () => _placeBid(amount),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
         decoration: BoxDecoration(
-           color: isHighest ? Colors.grey : const Color(0xFFFFD700),
+           color: isDisabled ? Colors.grey : const Color(0xFFFFD700),
            borderRadius: BorderRadius.circular(8),
-           boxShadow: isHighest ? const [] : const [BoxShadow(color: Color(0x66FFD700), blurRadius: 5)],
+           boxShadow: isDisabled ? const [] : const [BoxShadow(color: Color(0x66FFD700), blurRadius: 5)],
         ),
-        child: Text(label, style: TextStyle(color: isHighest ? Colors.white54 : Colors.black, fontWeight: FontWeight.bold, fontSize: 12)),
+        child: Text(label, style: TextStyle(color: isDisabled ? Colors.white54 : Colors.black, fontWeight: FontWeight.bold, fontSize: 12)),
       ),
     );
   }
@@ -919,17 +1092,18 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         child: Column(
           children: [
             TabBar( // Use the class's _tabController
-              controller: _tabController,
-              indicatorColor: Color(0xFFFFD700), labelColor: Color(0xFFFFD700), unselectedLabelColor: Colors.white54,
-              labelStyle: TextStyle(fontWeight: FontWeight.bold, fontSize: 12), isScrollable: true,
-              tabs: [
-                Tab(text: "ACTIVITY", icon: Icon(Icons.chat_bubble_outline, size: 18)),
-                Tab(text: "STATS", icon: Icon(Icons.bar_chart, size: 18)),
-                Tab(text: "SQUAD", icon: Icon(Icons.shield_outlined, size: 18)),
-                Tab(text: "RESULTS", icon: Icon(Icons.leaderboard_outlined, size: 18)),
-                Tab(text: "SETTINGS", icon: Icon(Icons.settings_outlined, size: 18)),
-              ],
-            ),
+            controller: _tabController,
+            indicatorColor: Color(0xFFFFD700), labelColor: Color(0xFFFFD700), unselectedLabelColor: Colors.white54,
+            labelStyle: TextStyle(fontWeight: FontWeight.bold, fontSize: 10),
+            labelPadding: const EdgeInsets.symmetric(horizontal: 2.0),
+            tabs: [
+              Tab(text: "ACTIVITY", icon: Icon(Icons.chat_bubble_outline, size: 18)),
+              Tab(text: "STATS", icon: Icon(Icons.bar_chart, size: 18)),
+              Tab(text: "SQUAD", icon: Icon(Icons.shield_outlined, size: 18)),
+              Tab(text: "RESULTS", icon: Icon(Icons.leaderboard_outlined, size: 18)),
+              Tab(text: "SETTINGS", icon: Icon(Icons.settings_outlined, size: 18)),
+            ],
+          ),
             const Divider(height: 1, color: Colors.white12),
             Expanded(
               child: TabBarView(
@@ -985,7 +1159,9 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                 if (players.isEmpty) continue; 
                 
                 int totalRating = 0;
-                int batters = 0, bowlers = 0, allRounders = 0;
+                double totalBattingScore = 0.0;
+                double totalBowlingScore = 0.0;
+                int batters = 0, bowlers = 0, allRounders = 0, wicketkeepers = 0;
                 int totalSpent = 0;
                 
                 for (var p in players) {
@@ -993,14 +1169,42 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                   int price = p["price"] ?? 0;
                   totalSpent += price;
                   
-                  totalRating += (price / 1000000).ceil(); 
+                  int matches = p["matches"] ?? 0;
+                  int runs = p["runs"] ?? 0;
+                  double avg = (p["average"] ?? 0.0).toDouble();
+                  double sr = (p["strikeRate"] ?? 0.0).toDouble();
+                  int wickets = p["wickets"] ?? 0;
+                  double econ = (p["economy"] ?? 0.0).toDouble();
+                  int fielding = p["fielding"] ?? 0;
+
+                  double batScore = (runs * 0.35) + (avg * 0.25) + (sr * 0.20) + (matches * 0.20);
+                  double bowlScore = (wickets * 0.40) + (matches * 0.20) + ((10 - econ) * 0.40);
+                  double playerRating = 0.0;
                   
-                  if (role.contains("bat")) batters++;
-                  else if (role.contains("bowl")) bowlers++;
-                  else if (role.contains("all") || role.contains("round")) allRounders++;
+                  if (role.contains("bat")) {
+                     batters++;
+                     playerRating = batScore;
+                  } else if (role.contains("bowl")) {
+                     bowlers++;
+                     playerRating = bowlScore;
+                  } else if (role.contains("all") || role.contains("round")) {
+                     allRounders++;
+                     playerRating = batScore + bowlScore;
+                  } else if (role.contains("keeper") || role.contains("wk")) {
+                     wicketkeepers++;
+                     playerRating = batScore + (fielding * 0.1);
+                  } else {
+                     batters++;
+                     playerRating = batScore;
+                  }
+                  
+                  totalBattingScore += batScore;
+                  totalBowlingScore += bowlScore;
+                  totalRating += playerRating.round();
                 }
                 
-                if (batters >= 3 && bowlers >= 3 && allRounders >= 2) {
+                bool hasBonus = batters >= 5 && bowlers >= 4 && allRounders >= 2 && wicketkeepers >= 1;
+                if (hasBonus) {
                    totalRating += 50; 
                 }
                 
@@ -1010,8 +1214,10 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                   "team": team,
                   "players": players.length,
                   "rating": totalRating,
+                  "battingStrength": totalBattingScore.round(),
+                  "bowlingStrength": totalBowlingScore.round(),
                   "purse": remainingPurse,
-                  "balanceBonus": batters >= 3 && bowlers >= 3 && allRounders >= 2
+                  "balanceBonus": hasBonus
                 });
               }
               
@@ -1048,11 +1254,28 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
                                   ]
                                 ),
                                 const SizedBox(height: 4),
-                                Text("${tr["players"]} Players • Rating: ${tr["rating"]}", style: const TextStyle(color: Colors.blueAccent, fontSize: 10)),
-                             ],
-                           ),
-                         ),
-                         Text("₹${(tr["purse"]/10000000).toStringAsFixed(2)} Cr", style: const TextStyle(color: Color(0xFFDAA520), fontWeight: FontWeight.bold)),
+                                 Text("${tr["players"]} Players • Rating: ${tr["rating"]}", style: const TextStyle(color: Colors.blueAccent, fontSize: 13, fontWeight: FontWeight.bold)),
+                                 const SizedBox(height: 2),
+                                 Row(
+                                    children: [
+                                      const Icon(Icons.sports_cricket, color: Colors.orangeAccent, size: 12),
+                                      const SizedBox(width: 4),
+                                      Text("BAT: ${tr["battingStrength"]}  ", style: const TextStyle(color: Colors.white70, fontSize: 10)),
+                                      const Icon(Icons.sports_baseball, color: Colors.redAccent, size: 12),
+                                      const SizedBox(width: 4),
+                                      Text("BOWL: ${tr["bowlingStrength"]}", style: const TextStyle(color: Colors.white70, fontSize: 10)),
+                                    ]
+                                 ),
+                              ],
+                            ),
+                          ),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                               Text("Score", style: TextStyle(color: Colors.white54, fontSize: 10)),
+                               Text("${tr["rating"]}", style: const TextStyle(color: Color(0xFFFFD700), fontWeight: FontWeight.bold, fontSize: 18)),
+                            ],
+                          ),
                       ],
                     ),
                   );
@@ -1069,73 +1292,64 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       children: [
         Expanded(
           child: StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").orderBy("timestamp", descending: false).snapshots(),
+            stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").orderBy("timestamp", descending: true).limit(50).snapshots(),
             builder: (context, snapshot) {
               if (!snapshot.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFFFFD700)));
               var docs = snapshot.data!.docs;
               
-              // Auto scroll to bottom trick if needed without ScrollController: wrap in reverse ListView
+              // WhatsApp style: reverse ListView anchored to bottom
               return ListView.builder(
+                reverse: true,
                 padding: const EdgeInsets.all(16),
                 itemCount: docs.length,
                 itemBuilder: (context, index) {
-                  var data = docs[index].data() as Map<String, dynamic>;
-                  String text = data["text"] ?? "";
-                  String type = data["type"] ?? "system";
-                  String senderName = data["senderName"] ?? "";
-                  Timestamp? ts = data["timestamp"] as Timestamp?;
-                  String timeString = ts != null ? "${ts.toDate().hour.toString().padLeft(2, '0')}:${ts.toDate().minute.toString().padLeft(2, '0')}" : "";
-                  
-                  bool isMe = senderName == _playerName && type == "chat";
-                  
-                  if (type == "system" || type == "bid") {
-                    return Center(
-                      child: Container(
-                        margin: const EdgeInsets.only(bottom: 12),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        decoration: BoxDecoration(color: type == "bid" ? const Color(0xFFDAA520).withOpacity(0.2) : Colors.white.withOpacity(0.1), borderRadius: BorderRadius.circular(20), border: Border.all(color: type == "bid" ? const Color(0xFFFFD700).withOpacity(0.5) : Colors.white24)),
-                        child: Text(text, style: TextStyle(color: type == "bid" ? const Color(0xFFFFD700) : Colors.white70, fontSize: 11, fontStyle: FontStyle.italic)),
-                      )
-                    );
-                  }
+                var data = docs[index].data() as Map<String, dynamic>;
+                String text = data["text"] ?? "";
+                String type = data["type"] ?? "system";
+                String senderName = data["senderName"] ?? "";
+                String senderTeam = data["team"] ?? "";
+                Timestamp? ts = data["timestamp"] as Timestamp?;
+                String timeString = ts != null ? "${ts.toDate().hour.toString().padLeft(2, '0')}:${ts.toDate().minute.toString().padLeft(2, '0')}" : "";
+                
+                bool isMe = senderName == _playerName && type == "chat";
 
-                  return Align(
-                    alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                List<Color> teamColorsArray = teamColors[senderTeam] ?? [Colors.grey, Colors.blueGrey];
+                Color teamBaseColor = teamColorsArray[0];
+                
+                if (type == "system" || type == "bid") {
+                  return Center(
                     child: Container(
-                      margin: const EdgeInsets.only(bottom: 12, left: 16, right: 16),
-                      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: isMe ? const Color(0xFF14532D).withOpacity(0.8) : const Color(0xFF2D2D2D).withOpacity(0.8), // WhatsApp dark green vs dark grey
-                        borderRadius: BorderRadius.only(
-                          topLeft: const Radius.circular(16),
-                          topRight: const Radius.circular(16),
-                          bottomLeft: Radius.circular(isMe ? 16 : 0),
-                          bottomRight: Radius.circular(isMe ? 0 : 16)
-                        ),
-                        border: Border.all(color: isMe ? Colors.greenAccent.withOpacity(0.3) : Colors.white24),
-                        boxShadow: const [BoxShadow(color: Colors.black26, offset: Offset(0, 2), blurRadius: 4)]
-                      ),
-                      child: Column(
-                        crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-                        children: [
-                          if (!isMe) Text(senderName.isNotEmpty ? senderName : "Unknown", style: const TextStyle(color: Color(0xFFFFD700), fontSize: 10, fontWeight: FontWeight.bold)),
-                          if (!isMe) const SizedBox(height: 4),
-                          Text(text, style: const TextStyle(color: Colors.white, fontSize: 14)),
-                          const SizedBox(height: 4),
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(timeString, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 9)),
-                              if (isMe) const SizedBox(width: 4),
-                              if (isMe) const Icon(Icons.done_all, size: 12, color: Colors.blueAccent), // Fake read receipt
-                            ],
-                          )
-                        ],
-                      ),
-                    ),
+                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      decoration: BoxDecoration(color: type == "bid" ? const Color(0xFFDAA520).withOpacity(0.2) : Colors.white.withOpacity(0.1), borderRadius: BorderRadius.circular(20), border: Border.all(color: type == "bid" ? const Color(0xFFFFD700).withOpacity(0.5) : Colors.white24)),
+                      child: Text(text, style: TextStyle(color: type == "bid" ? const Color(0xFFFFD700) : Colors.white70, fontSize: 11, fontStyle: FontStyle.italic)),
+                    )
                   );
-                },
+                }
+
+                return Align(
+                  alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                  child: Container(
+                    margin: const EdgeInsets.only(bottom: 12, left: 16, right: 16),
+                    constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: teamBaseColor.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: teamBaseColor.withOpacity(0.5)),
+                      boxShadow: const [BoxShadow(color: Colors.black26, offset: Offset(0, 2), blurRadius: 4)]
+                    ),
+                    child: Column(
+                      crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                      children: [
+                        if (!isMe) Text(senderName.isNotEmpty ? senderName : "Unknown", style: TextStyle(color: teamBaseColor, fontSize: 10, fontWeight: FontWeight.bold)),
+                        if (!isMe) const SizedBox(height: 4),
+                        Text(text, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                      ],
+                    ),
+                  ),
+                );
+              },
               );
             },
           ),
@@ -1203,58 +1417,88 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   }
   
   Widget _buildUpcomingView() {
-    return Column(
-      children: [
-        Container(
-          margin: const EdgeInsets.all(16), padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(color: Colors.blueAccent.withOpacity(0.1), borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.blueAccent.withOpacity(0.5))),
-          child: const Text("Upcoming players will be chosen randomly from each set during the auction.", style: TextStyle(color: Colors.blueAccent, fontSize: 12), textAlign: TextAlign.center),
-        ),
-        Expanded(
-          child: StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance.collection("players").snapshots(),
-            builder: (context, playersSnapshot) {
-              if (!playersSnapshot.hasData) return const Center(child: CircularProgressIndicator());
+  return StreamBuilder<QuerySnapshot>(
+    stream: FirebaseFirestore.instance.collection("players").snapshots(),
+    builder: (context, playersSnapshot) {
+      if (!playersSnapshot.hasData) return const Center(child: CircularProgressIndicator());
+      
+      return StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").snapshots(),
+        builder: (context, soldSnapshot) {
+          return StreamBuilder<QuerySnapshot>(
+            stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("unsoldPlayers").snapshots(),
+            builder: (context, unsoldSnapshot) {
+              if (!soldSnapshot.hasData || !unsoldSnapshot.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFFFFD700)));
               
-              return StreamBuilder<QuerySnapshot>(
-                stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").snapshots(),
-                builder: (context, soldSnapshot) {
-                  return StreamBuilder<QuerySnapshot>(
-                    stream: FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("unsoldPlayers").snapshots(),
-                    builder: (context, unsoldSnapshot) {
-                      if (!soldSnapshot.hasData || !unsoldSnapshot.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFFFFD700)));
-                      
-                      Set<String> processedIds = {};
-                      processedIds.addAll(soldSnapshot.data!.docs.map((d) => d.id));
-                      processedIds.addAll(unsoldSnapshot.data!.docs.map((d) => d.id));
-                      
-                      var upcomingPlayers = playersSnapshot.data!.docs.where((p) => !processedIds.contains(p.id) && p.id != _currentPlayerId).toList();
+              Set<String> processedIds = {};
+              processedIds.addAll(soldSnapshot.data!.docs.map((d) => d.id));
+              processedIds.addAll(unsoldSnapshot.data!.docs.map((d) => d.id));
+              
+              var upcomingPlayers = playersSnapshot.data!.docs.where((p) {
+                 var pData = p.data() as Map<String, dynamic>;
+                 String pName = (pData["name"] ?? "").toString().toLowerCase();
+                 String pRole = (pData["role"] ?? "").toString().toLowerCase();
+                 bool matchesSearch = _upcomingSearchQuery.isEmpty || pName.contains(_upcomingSearchQuery) || pRole.contains(_upcomingSearchQuery);
+                 return matchesSearch && !processedIds.contains(p.id) && p.id != _currentPlayerId;
+              }).toList();
 
-                      return GridView.builder(
-                        physics: const BouncingScrollPhysics(),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                          maxCrossAxisExtent: 110, 
-                          childAspectRatio: 0.65, 
-                          crossAxisSpacing: 10, 
-                          mainAxisSpacing: 10
+              return CustomScrollView(
+                physics: const BouncingScrollPhysics(),
+                slivers: [
+                  SliverToBoxAdapter(
+                    child: Container(
+                      margin: const EdgeInsets.all(16), padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(color: Colors.blueAccent.withOpacity(0.1), borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.blueAccent.withOpacity(0.5))),
+                      child: const Text("Upcoming players will be chosen randomly from each set during the auction.", style: TextStyle(color: Colors.blueAccent, fontSize: 12), textAlign: TextAlign.center),
+                    ),
+                  ),
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      child: TextField(
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: "Search player...",
+                          hintStyle: const TextStyle(color: Colors.white54),
+                          prefixIcon: const Icon(Icons.search, color: Colors.blueAccent),
+                          filled: true,
+                          fillColor: Colors.white.withOpacity(0.05),
+                          contentPadding: const EdgeInsets.symmetric(vertical: 0),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
                         ),
-                        itemCount: upcomingPlayers.length,
-                        itemBuilder: (context, index) {
+                        onChanged: (value) {
+                           setState(() { _upcomingSearchQuery = value.toLowerCase(); });
+                        },
+                      ),
+                    ),
+                  ),
+                  SliverPadding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    sliver: SliverGrid(
+                      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: 110, 
+                        childAspectRatio: 0.65, 
+                        crossAxisSpacing: 10, 
+                        mainAxisSpacing: 10
+                      ),
+                      delegate: SliverChildBuilderDelegate(
+                        (context, index) {
                           var p = upcomingPlayers[index].data() as Map<String, dynamic>;
                           return PlayerGridCard(player: p, status: "");
                         },
-                      );
-                    }
-                  );
-                }
+                        childCount: upcomingPlayers.length,
+                      ),
+                    ),
+                  ),
+                ],
               );
-            },
-          ),
-        ),
-      ],
-    );
-  }
+            }
+          );
+        }
+      );
+    },
+  );
+}
 
   Widget _buildSoldPlayersView() {
     return StreamBuilder<QuerySnapshot>(
