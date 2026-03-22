@@ -23,7 +23,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   String _playerName = "";
   final TextEditingController _playerNameController = TextEditingController();
 
-  double _myPurse = 100000000;
+  double _myPurse = 1200000000;
   StreamSubscription<DocumentSnapshot>? _myPurseSubscription;
   String _upcomingSearchQuery = "";
 
@@ -127,7 +127,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       _savedTeam = saved;
       _selectedTeam = saved;
       _playerName = savedName;
-      _myPurse = (data['purse'] ?? 100000000).toDouble();
+      _myPurse = (data['purse'] ?? 1200000000).toDouble();
       _isReconnecting = status == 'offline'; // true = was offline before
     });
 
@@ -157,7 +157,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         .listen((snap) {
       if (snap.exists && mounted) {
         setState(() {
-          _myPurse = (snap.data()?['purse'] ?? 100000000).toDouble();
+          _myPurse = (snap.data()?['purse'] ?? 1200000000).toDouble();
         });
       }
     });
@@ -280,7 +280,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
             double maxPurse = 0;
             
             for (var pDoc in qSnap.docs) {
-               double currentPurse = (pDoc.data()["purse"] ?? 100000000).toDouble();
+               double currentPurse = (pDoc.data()["purse"] ?? 1200000000).toDouble();
                if (pDoc.data()["team"] == _highestBidder) {
                   currentPurse = currentPurse - _currentBid;
                   pDoc.reference.update({"purse": currentPurse});
@@ -426,7 +426,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       "team": _selectedTeam,
       "playerName": _playerName,
       "timestamp": FieldValue.serverTimestamp(),
-      "purse": 100000000, // Starting purse for each team
+      "purse": 1200000000, // Starting purse for each team
       "status": "online",
     });
 
@@ -450,7 +450,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         .listen((snap) {
       if (snap.exists && mounted) {
         setState(() {
-          _myPurse = (snap.data()?["purse"] ?? 100000000).toDouble();
+          _myPurse = (snap.data()?["purse"] ?? 1200000000).toDouble();
         });
       }
     });
