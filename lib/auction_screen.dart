@@ -23,7 +23,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
   String _playerName = "";
   final TextEditingController _playerNameController = TextEditingController();
 
-  double _myPurse = 1000000000;
+  double _myPurse = 100000000;
   StreamSubscription<DocumentSnapshot>? _myPurseSubscription;
   String _upcomingSearchQuery = "";
 
@@ -127,7 +127,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       _savedTeam = saved;
       _selectedTeam = saved;
       _playerName = savedName;
-      _myPurse = (data['purse'] ?? 1000000000).toDouble();
+      _myPurse = (data['purse'] ?? 100000000).toDouble();
       _isReconnecting = status == 'offline'; // true = was offline before
     });
 
@@ -157,7 +157,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         .listen((snap) {
       if (snap.exists && mounted) {
         setState(() {
-          _myPurse = (snap.data()?['purse'] ?? 1000000000).toDouble();
+          _myPurse = (snap.data()?['purse'] ?? 100000000).toDouble();
         });
       }
     });
@@ -277,24 +277,38 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
        if (!isUnsold && _currentPlayerId.isNotEmpty) {
           // Deduct purse and Check for Auto-End Condition
          FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").get().then((qSnap) async {
-            bool allPursesEmpty = qSnap.docs.isNotEmpty; // Prevent solo rooms from auto-ending falsely
+            double maxPurse = 0;
             
             for (var pDoc in qSnap.docs) {
-               double currentPurse = (pDoc.data()["purse"] ?? 1000000000).toDouble();
+               double currentPurse = (pDoc.data()["purse"] ?? 100000000).toDouble();
                if (pDoc.data()["team"] == _highestBidder) {
                   currentPurse = currentPurse - _currentBid;
                   pDoc.reference.update({"purse": currentPurse});
                }
                
-               // Check if any team has enough purse to make a minimum bid (20 Lakhs)
-               if (currentPurse >= 2000000) { 
-                  allPursesEmpty = false;
+               if (pDoc.data()["status"] == 'online') {
+                  if (currentPurse > maxPurse) maxPurse = currentPurse;
                }
             }
             
-            // If all purses are effectively empty and this is the host, end the auction automatically
-            if (allPursesEmpty && widget.isHost) {
-               FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
+            if (widget.isHost) {
+                var playersSnap = await FirebaseFirestore.instance.collection("players").get();
+                var soldSnap = await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("soldPlayers").get();
+                var unsoldSnap = await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("unsoldPlayers").get();
+                
+                Set<String> processedIds = soldSnap.docs.map((d) => d.id).toSet();
+                processedIds.addAll(unsoldSnap.docs.map((d) => d.id).toSet());
+                processedIds.add(_currentPlayerId);
+
+                var available = playersSnap.docs.where((p) => !processedIds.contains(p.id)).toList();
+                
+                double minBasePrice = available.isNotEmpty 
+                    ? available.map<double>((p) => (p.data() as Map<String, dynamic>)["basePrice"]?.toDouble() ?? 2000000.0).reduce((a, b) => min(a, b))
+                    : 2000000.0;
+
+                if (maxPurse < minBasePrice && qSnap.docs.isNotEmpty) {
+                   FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
+                }
             }
          });
          
@@ -412,7 +426,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       "team": _selectedTeam,
       "playerName": _playerName,
       "timestamp": FieldValue.serverTimestamp(),
-      "purse": 1000000000, // Starting purse for each team
+      "purse": 100000000, // Starting purse for each team
       "status": "online",
     });
 
@@ -436,7 +450,7 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
         .listen((snap) {
       if (snap.exists && mounted) {
         setState(() {
-          _myPurse = (snap.data()?["purse"] ?? 1000000000).toDouble();
+          _myPurse = (snap.data()?["purse"] ?? 100000000).toDouble();
         });
       }
     });
@@ -519,10 +533,50 @@ class _AuctionScreenState extends State<AuctionScreen> with TickerProviderStateM
       }
       return;
     }
+    
+    // Check if any team has enough purse for the CHEAPEST available player
+    var teamSnap = await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("participants").where("status", isEqualTo: "online").get();
+    double maxPurse = 0;
+    if (teamSnap.docs.isNotEmpty) {
+      maxPurse = teamSnap.docs.map<double>((d) => (d.data()["purse"] ?? 0).toDouble()).reduce((a, b) => max(a, b));
+    }
+    
+    double minBasePrice = available.map<double>((p) => (p.data() as Map<String, dynamic>)["basePrice"]?.toDouble() ?? 2000000.0).reduce((a, b) => min(a, b));
+    
+    if (teamSnap.docs.isNotEmpty && maxPurse < minBasePrice) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("No team has enough purse to bid on any remaining players. Auction automatically concluded.")));
+        FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({"status": "ended"});
+      }
+      return;
+    }
 
     // 2. Randomly select one
     var randomPlayer = available[Random().nextInt(available.length)];
     var data = randomPlayer.data() as Map<String, dynamic>;
+
+    // Auto-skip logic: If the CURRENT player's base price is higher than the max online purse, instantly skip them!
+    double currentBasePrice = (data["basePrice"] ?? 0).toDouble();
+    if (teamSnap.docs.isNotEmpty && maxPurse < currentBasePrice) {
+      await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("unsoldPlayers").doc(randomPlayer.id).set({
+        "name": data["name"] ?? "Unknown",
+        "basePrice": data["basePrice"] ?? 0,
+        "role": data["role"] ?? "Unknown",
+        "nationality": data["nationality"] ?? "Unknown",
+        "imageUrl": data["imageUrl"] ?? "https://via.placeholder.com/150",
+      });
+      
+      // Post system message cleanly so activity log explains the skip
+      await FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).collection("activity").add({
+         "text": "UNSOLD (Auto-Skipped)! No team had enough purse for ${data['name']} (Base: ₹${(currentBasePrice / 10000000).toStringAsFixed(2)} Cr)",
+         "timestamp": FieldValue.serverTimestamp(),
+         "type": "system",
+      });
+
+      await Future.delayed(const Duration(milliseconds: 300));
+      if (mounted) _startAuction();
+      return;
+    }
 
     // 3. Update room
     FirebaseFirestore.instance.collection("rooms").doc(widget.roomId).update({

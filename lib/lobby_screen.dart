@@ -43,7 +43,7 @@ class _LobbyScreenState extends State<LobbyScreen> {
         .set({
       "name": widget.userName,
       "team": team,
-      "purse": 10000000
+      "purse": 100000000
     });
 
     await FirebaseFirestore.instance
